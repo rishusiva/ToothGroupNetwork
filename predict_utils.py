@@ -28,9 +28,6 @@ class ScanSegmentation():  # SegmentationAlgorithm is not inherited in this clas
         """
         self.chl_pipeline = model
 
-        #self.model = load_model()
-        #sef.device = "cuda"
-
         pass
 
     @staticmethod

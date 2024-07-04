@@ -1,14 +1,20 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 import numpy as np
-from external_libs.pointops.functions import pointops
-from .utils import *
-from .basic_operators import *
-from .basic_operators import _eps, _inf
+from scipy.spatial import KDTree
+import re
 
-from collections import defaultdict
+def get_ftype(ftype_key):
+    """
+    Mock-up function to determine feature types based on a provided key.
+    You should modify this according to your actual configuration needs.
+    """
+    # Example feature types dictionary
+    feature_types = {
+        'latent': ('latent', 512),   # Tuple format could be (type, dimension)
+        'logits': ('logits', 10),
+    }
+    return feature_types.get(ftype_key, ('unknown', 0))  # Default return if key not found
 
 
 class PointTransformerLayer(nn.Module):
@@ -23,75 +29,96 @@ class PointTransformerLayer(nn.Module):
         self.linear_v = nn.Linear(in_planes, out_planes)
         self.linear_p = nn.Sequential(nn.Linear(3, 3), nn.BatchNorm1d(3), nn.ReLU(inplace=True), nn.Linear(3, out_planes))
         self.linear_w = nn.Sequential(nn.BatchNorm1d(mid_planes), nn.ReLU(inplace=True),
-                                    nn.Linear(mid_planes, mid_planes // share_planes),
-                                    nn.BatchNorm1d(mid_planes // share_planes), nn.ReLU(inplace=True),
-                                    nn.Linear(out_planes // share_planes, out_planes // share_planes))
+                                      nn.Linear(mid_planes, mid_planes // share_planes),
+                                      nn.BatchNorm1d(mid_planes // share_planes), nn.ReLU(inplace=True),
+                                      nn.Linear(out_planes // share_planes, out_planes // share_planes))
         self.softmax = nn.Softmax(dim=1)
         
-    def forward(self, pxo) -> torch.Tensor:
-        p, x, o = pxo  # (n, 3), (n, c), (b)
-        x_q, x_k, x_v = self.linear_q(x), self.linear_k(x), self.linear_v(x)  # (n, c)
-        x_k = pointops.queryandgroup(self.nsample, p, p, x_k, None, o, o, use_xyz=True)  # (n, nsample, 3+c)
-        x_v = pointops.queryandgroup(self.nsample, p, p, x_v, None, o, o, use_xyz=False)  # (n, nsample, c)
-        p_r, x_k = x_k[:, :, 0:3], x_k[:, :, 3:]
-        # torch batch-norm should use (n, c, nsample)
-        for i, layer in enumerate(self.linear_p): p_r = layer(p_r.transpose(1, 2).contiguous()).transpose(1, 2).contiguous() if i == 1 else layer(p_r)    # (n, nsample, c)
-        w = x_k - x_q.unsqueeze(1) + p_r.view(p_r.shape[0], p_r.shape[1], self.out_planes // self.mid_planes, self.mid_planes).sum(2)  # (n, nsample, c)
-        for i, layer in enumerate(self.linear_w): w = layer(w.transpose(1, 2).contiguous()).transpose(1, 2).contiguous() if i % 3 == 0 else layer(w)
-        w = self.softmax(w)  # (n, nsample, c)
-        n, nsample, c = x_v.shape; s = self.share_planes
-        x = ((x_v + p_r).view(n, nsample, s, c // s) * w.unsqueeze(2)).sum(1).view(n, c)  # v * A
+    def forward(self, pxo):
+        p, x, o = pxo
+        x_q, x_k, x_v = self.linear_q(x), self.linear_k(x), self.linear_v(x)
+        grouped_x_k = self.query_and_group(x_k, p, nsample=self.nsample, include_pos=True)
+        grouped_x_v = self.query_and_group(x_v, p, nsample=self.nsample, include_pos=False)
+        
+        p_r = grouped_x_k[:, :, :3] 
+        x_k = grouped_x_k[:, :, 3:]
+        
+        p_r = self.linear_p(p_r)
+        w = x_k - x_q.unsqueeze(1) + p_r  
+        w = self.linear_w(w)
+        w = self.softmax(w)
+
+        x = ((grouped_x_v + p_r) * w.unsqueeze(2)).sum(1)
         return x
 
+    def query_and_group(self, features, points, nsample=16, include_pos=True):
+        tree = KDTree(points.cpu().numpy())
+        _, idx = tree.query(points.cpu().numpy(), k=nsample)
+        idx = torch.from_numpy(idx).to(points.device)
+        grouped_features = features[idx, :]
+        
+        if include_pos:
+            grouped_points = points[idx, :]
+            grouped_features = torch.cat([grouped_points, grouped_features], dim=-1)
+        
+        return grouped_features
 
 class TransitionDown(nn.Module):
     def __init__(self, in_planes, out_planes, stride=1, nsample=16):
         super().__init__()
         self.stride, self.nsample = stride, nsample
-        if stride != 1:
-            self.linear = nn.Linear(3+in_planes, out_planes, bias=False)
-            self.pool = nn.MaxPool1d(nsample)
-        else:
-            self.linear = nn.Linear(in_planes, out_planes, bias=False)
+        self.linear = nn.Linear(3 + in_planes if stride != 1 else in_planes, out_planes, bias=False)
+        self.pool = nn.MaxPool1d(nsample) if stride != 1 else None
         self.bn = nn.BatchNorm1d(out_planes)
         self.relu = nn.ReLU(inplace=True)
         
     def forward(self, pxo):
-        # o - num of points in each batch - b batch together - using BxN, used for finding the points in each example
-        p, x, o = pxo  # (n, 3), (n, c), (b)
+        p, x, o = pxo
         if self.stride != 1:
-            # calc the reduced size of points for the batch - n = [BxN], with each b clouds, i-th cloud containing N = b[i] points
-            n_o, count = [o[0].item() // self.stride], o[0].item() // self.stride
-            for i in range(1, o.shape[0]):
-                count += (o[i].item() - o[i-1].item()) // self.stride
-                n_o.append(count)
-            n_o = torch.cuda.IntTensor(n_o)
-            idx = pointops.furthestsampling(p, o, n_o)  # (m)
-            n_p = p[idx.long(), :]  # (m, 3)
-            x = pointops.queryandgroup(self.nsample, p, n_p, x, None, o, n_o, use_xyz=True)  # (m, 3+c, nsample)
-            x = self.relu(self.bn(self.linear(x).transpose(1, 2).contiguous()))  # (m, c, nsample)
-            x = self.pool(x).squeeze(-1)  # (m, c)
-            p, o = n_p, n_o
-            #import gen_utils as gu
-            #gu.print_3d(gu.torch_to_numpy(p), gu.np_to_pcd(gu.torch_to_numpy(n_p)+0.001, color=[0,1,0]))
+            new_p = furthest_point_sampling(p.cpu().numpy(), len(p) // self.stride)
+            new_p = torch.from_numpy(new_p).to(p.device)
+            grouped_features = self.query_and_group(x, p, new_p, nsample=self.nsample)
+            x = self.relu(self.bn(self.linear(grouped_features).transpose(1, 2).contiguous()))
+            x = self.pool(x).squeeze(-1)
+            p = new_p
         else:
-            x = self.relu(self.bn(self.linear(x)))  # (n, c)
+            x = self.relu(self.bn(self.linear(x)))
         return [p, x, o]
+
+    def query_and_group(self, features, points, new_points, nsample=16):
+        tree = KDTree(points.cpu().numpy())
+        _, idx = tree.query(new_points.cpu().numpy(), k=nsample)
+        idx = torch.from_numpy(idx).to(points.device)
+        grouped_features = features[idx, :]
+        
+        grouped_points = points[idx, :]
+        grouped_features = torch.cat([grouped_points, grouped_features], dim=-1)
+        
+        return grouped_features
+
+def furthest_point_sampling(points, n_samples):
+    farthest_pts = np.zeros((n_samples, points.shape[1]))
+    farthest_pts_idx = np.random.choice(len(points), 1)
+    for i in range(1, n_samples):
+        distances = np.sum((points - points[farthest_pts_idx[-1]])**2, axis=1)
+        farthest_pts_idx = np.append(farthest_pts_idx, np.argmax(distances))
+    farthest_pts = points[farthest_pts_idx]
+    return farthest_pts
 
 
 class TransitionUp(nn.Module):
     def __init__(self, in_planes, out_planes=None):
         super().__init__()
         if out_planes is None:
-            self.linear1 = nn.Sequential(nn.Linear(2*in_planes, in_planes), nn.BatchNorm1d(in_planes), nn.ReLU(inplace=True))
+            self.linear1 = nn.Sequential(nn.Linear(2 * in_planes, in_planes), nn.BatchNorm1d(in_planes), nn.ReLU(inplace=True))
             self.linear2 = nn.Sequential(nn.Linear(in_planes, in_planes), nn.ReLU(inplace=True))
         else:
             self.linear1 = nn.Sequential(nn.Linear(out_planes, out_planes), nn.BatchNorm1d(out_planes), nn.ReLU(inplace=True))
             self.linear2 = nn.Sequential(nn.Linear(in_planes, out_planes), nn.BatchNorm1d(out_planes), nn.ReLU(inplace=True))
-        
+
     def forward(self, pxo1, pxo2=None):
         if pxo2 is None:
-            _, x, o = pxo1  # (n, 3), (n, c), (b)
+            p, x, o = pxo1
             x_tmp = []
             for i in range(o.shape[0]):
                 if i == 0:
@@ -99,16 +126,31 @@ class TransitionUp(nn.Module):
                 else:
                     s_i, e_i, cnt = o[i-1], o[i], o[i] - o[i-1]
                 x_b = x[s_i:e_i, :]
-                # concat each with per-cloud mean => finally x = mlp[ x, mlp[mean(x)] ]
-                x_b = torch.cat((x_b, self.linear2(x_b.sum(0, True) / cnt).repeat(cnt, 1)), 1)
+                x_b = torch.cat((x_b, self.linear2(x_b.mean(0, keepdim=True).repeat(cnt, 1))), 1)
                 x_tmp.append(x_b)
             x = torch.cat(x_tmp, 0)
             x = self.linear1(x)
         else:
-            # upsample pxo2 to pxo1
-            p1, x1, o1 = pxo1; p2, x2, o2 = pxo2
-            x = self.linear1(x1) + pointops.interpolation(p2, p1, self.linear2(x2), o2, o1)
+            p1, x1, o1 = pxo1
+            p2, x2, o2 = pxo2
+
+            # Compute nearest neighbor interpolation
+            x = self.linear1(x1) + self.nearest_neighbor_interpolation(p2, p1, x2, o2, o1)
+
         return x
+
+    def nearest_neighbor_interpolation(self, p_src, p_tgt, f_src, idx_src, idx_tgt):
+        # This method uses KDTree to find the nearest neighbors in p_tgt for each point in p_src
+        tree = KDTree(p_tgt.cpu().numpy())
+        dist, idx = tree.query(p_src.cpu().numpy(), k=1)
+        idx = torch.from_numpy(idx).flatten().to(p_src.device)
+
+        # Interpolate features from source to target using nearest neighbor indices
+        f_tgt = f_src[idx, :]
+        return f_tgt
+
+# Additional class implementations (PointTransformerBlock, PtTransBlock, MLP, and MLPbyOps)
+# can be integrated similarly with appropriate replacements for CUDA dependencies.
 
 
 class PointTransformerBlock(nn.Module):
